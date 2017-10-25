@@ -15,6 +15,12 @@
 # 
 # For more information about Monte Carlo Tree Search check out our web site at www.mcts.ai
 
+import chainer
+import chainer.links as L
+import chainer.functions as F
+from chainer import optimizers
+from chainer import serializers
+
 import nltk
 import copy
 import zinc_grammar
@@ -26,17 +32,46 @@ import numpy as np
 
 np.random.seed(0)
 
+class RNN(chainer.Chain):
+    def __init__(self, rule_size, emb_dim=128, hidden_dim=256):
+        super(RNN, self).__init__()
+        with self.init_scope():
+            self.embed = L.EmbedID(rule_size, emb_dim)
+            self.lstm1 = L.LSTM(emb_dim, hidden_dim)
+            self.out = L.Linear(hidden_dim, rule_size)
+    
+    def reset_state(self):
+        self.lstm1.reset_state()
+    
+    def forward(self, x):
+        h = self.embed(x)
+        h = self.lstm1(h)
+        h = self.out(h)
+        pred = F.softmax(h)
+        return pred
+
+    def __call__(self, x, t):
+        h = self.embed(x)
+        h = self.lstm1(h)
+        h = self.out(h)
+        return F.softmax_cross_entropy(h, t)
+
 class State:
-    def __init__(self, moves=None, stack=None):
+    def __init__(self, moves=None, stack=None, rnn=None):
+        self.rnn = copy.deepcopy(rnn)
+        self.rnn.reset_state()
         if stack is None:
             self.moves = []
             self.stack = [str(zinc_grammar.GCFG.productions()[0].lhs())]
         else:
-            self.moves = moves
-            self.stack = stack
+            self.moves = copy.deepcopy(moves)
+            self.stack = copy.deepcopy(stack)
+            for s in self.moves:
+                self.rnn.forward(s)
+
     def Clone(self):
         # Create a deep clone of this state.
-        state = State(copy.deepcopy(self.moves), copy.deepcopy(self.stack))
+        state = State(self.moves, self.stack, self.rnn)
         return state
 
     def DoMove(self, move):
@@ -50,6 +85,36 @@ class State:
                                 zinc_grammar.GCFG.productions()[move].rhs())
         self.stack.extend(list(map(str, rhs))[::-1])
         self.moves.append(move)
+        self.rnn.forward(np.array([move]).astype(np.int32))
+
+    def Rollout(self):
+        eps = 1e-100
+        lhs_list = zinc_grammar.lhs_list
+        lhs_map = zinc_grammar.lhs_map
+        S = self.stack
+        sampled_rules = []
+        rule = np.array([self.moves[-1]]).astype(np.int32)
+        sequence_length = 300
+        for t in range(sequence_length):
+            try:
+                a = S.pop()
+            except:
+                break
+            next_nonterminal = lhs_map[a]
+            with chainer.using_config('train', False):
+                with chainer.no_backprop_mode():
+                    unmasked_probability = self.rnn.forward(rule).data[0]
+            mask = zinc_grammar.masks[next_nonterminal]
+            # Gumbel-max trick: 
+            masked_probability = np.log(np.exp(unmasked_probability) * mask + eps)
+            rule = np.argmax(masked_probability + np.random.gumbel(size=len(zinc_grammar.GCFG.productions())))
+            sampled_rules.append(rule)
+            rhs = filter(lambda a: (type(a) == nltk.grammar.Nonterminal) and (str(a) != 'None'),
+                          zinc_grammar.GCFG.productions()[rule].rhs())
+            S.extend(list(map(str, rhs))[::-1])
+            rule = np.array([rule]).astype(np.int32)
+        self.moves = self.moves + sampled_rules
+
         
     def GetMoves(self):
         # Get all possible moves from this state.
@@ -106,7 +171,8 @@ class Node:
         smiles = result[1]
         self.visits += 1
         self.sumScore += score
-        self.generatedSmiles.append(smiles)
+        if score > 0:
+            self.generatedSmiles.append(smiles)
 
     def __repr__(self):
         return "move:" + str(self.move) + ", sumScore:" + str(self.sumScore) + ", visits:" + str(self.visits) + ", untriedMoves:" + str(self.untriedMoves)
@@ -155,14 +221,7 @@ def MCTS(rootstate, itermax=100, verbose=False):
 
         # Rollout
         if verbose: print("start rollout")
-        size = 0
-        while state.GetMoves() != []: # while state is non-terminal
-            m = np.random.choice(state.GetMoves())
-            if verbose: print("move:", m)
-            state.DoMove(m)
-            size += 1
-            if size > 300:
-                break
+        state.Rollout()
         if verbose: print("finish rollout")
 
         # Backpropagate
@@ -176,7 +235,43 @@ def MCTS(rootstate, itermax=100, verbose=False):
     return rootnode.generatedSmiles
 
 def main():
-    rootstate = State()
+    print("loading data")
+    train_smiles = []
+    filename = '250k_rndm_zinc_drugs_clean.smi'
+    with open(filename) as f:
+        for line in f:
+            smiles = line.rstrip()
+            train_smiles.append(smiles)
+            if len(train_smiles) > 100:
+                break
+    print("converting data")
+    train_rules = cfg_util.encode(train_smiles)
+    print("finished converting data")
+
+    rnn = RNN(rule_size=len(zinc_grammar.GCFG.productions()))
+    serializers.load_npz("model.npz", rnn)
+    optimizer = optimizers.Adam()
+    optimizer.setup(rnn)
+
+    #print("start pre-training")
+    #for epoch in range(1000):
+    #    sequence = np.array([np.random.choice(train_rules)]).astype(np.int32)
+    #    loss = 0
+    #    rnn.reset_state()
+    #    for t in range(len(sequence[0])-1):
+    #        with chainer.using_config('train', True):
+    #             loss += rnn(sequence[:, t], sequence[:, t+1])
+    #             if t % 32 == 0 or t==len(sequence[0])-2:
+    #                 rnn.cleargrads()
+    #                 loss.backward()
+    #                 loss.unchain_backward()
+    #                 optimizer.update()
+    #    if epoch % 100 == 0:
+    #        serializers.save_npz("model.npz", rnn)
+    #        print("model saved.")
+    #print("finish pre-training")
+
+    rootstate = State(rnn=rnn)
     smiles = MCTS(rootstate, 100000)
     print(smiles)
 
