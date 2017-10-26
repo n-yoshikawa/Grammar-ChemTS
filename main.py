@@ -30,6 +30,8 @@ import smiles_util
 from math import *
 import numpy as np
 
+import os
+
 np.random.seed(0)
 
 class RNN(chainer.Chain):
@@ -249,7 +251,8 @@ def main():
     print("finished converting data")
 
     rnn = RNN(rule_size=len(zinc_grammar.GCFG.productions()))
-    serializers.load_npz("model.npz", rnn)
+    if os.path.exists("model.npz"):
+        serializers.load_npz("model.npz", rnn)
     optimizer = optimizers.Adam()
     optimizer.setup(rnn)
 
