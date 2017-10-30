@@ -61,7 +61,6 @@ class RNN(chainer.Chain):
 class State:
     def __init__(self, moves=None, stack=None, rnn=None):
         self.rnn = copy.deepcopy(rnn)
-        self.rnn.reset_state()
         if stack is None:
             self.moves = []
             self.stack = [str(zinc_grammar.GCFG.productions()[0].lhs())]
@@ -87,36 +86,53 @@ class State:
                                 zinc_grammar.GCFG.productions()[move].rhs())
         self.stack.extend(list(map(str, rhs))[::-1])
         self.moves.append(move)
-        self.rnn.forward(np.array([move]).astype(np.int32))
 
     def Rollout(self):
+        self.rnn.reset_state()
+        for m in self.moves:
+            self.rnn.forward(np.array([m]).astype(np.int32))
+        beam_width = 8 # must be bigger than 3!
         eps = 1e-100
         lhs_list = zinc_grammar.lhs_list
         lhs_map = zinc_grammar.lhs_map
-        S = self.stack
-        sampled_rules = []
-        rule = np.array([self.moves[-1]]).astype(np.int32)
-        sequence_length = 300
+        initial_stack = self.stack
+        initial_rule = self.moves
+        candidates = [(self.rnn, initial_stack, initial_rule, 0.0)]
+        sequence_length = 250
         for t in range(sequence_length):
-            try:
-                a = S.pop()
-            except:
+            next_candidates = []
+            for previous_model, previous_stack, rules, log_likelihood in candidates:
+                if len(previous_stack) == 0:
+                    next_candidates.append((None, previous_stack, rules, log_likelihood))
+                    continue
+                model = previous_model.copy()
+                x = np.asarray([rules[-1]]).astype(np.int32)
+                with chainer.using_config('train', False):
+                    with chainer.no_backprop_mode():
+                        unmasked_probability = model.forward(x).data[0]
+                stack = copy.copy(previous_stack)
+                next_nonterminal = lhs_map[stack.pop()]
+                mask = zinc_grammar.masks[next_nonterminal]
+                masked_log_probability = np.log(unmasked_probability * mask + eps)
+                order = masked_log_probability.argsort()[:-beam_width:-1]
+                for sampled_rule in order:
+                    if masked_log_probability[sampled_rule] > np.log(eps) + eps:
+                        rhs = filter(lambda a: (type(a) == nltk.grammar.Nonterminal) 
+                                                and (str(a) != 'None'),
+                                                zinc_grammar.GCFG.productions()[sampled_rule].rhs())
+                        next_candidates.append(
+                            (model, stack+list(map(str, rhs))[::-1],
+                             rules + [sampled_rule],
+                             log_likelihood + masked_log_probability[sampled_rule]))
+            candidates = sorted(next_candidates, key=lambda x: -x[3])[:beam_width]
+            if all([len(candidate[1]) == 0 for candidate in candidates]):
                 break
-            next_nonterminal = lhs_map[a]
-            with chainer.using_config('train', False):
-                with chainer.no_backprop_mode():
-                    unmasked_probability = self.rnn.forward(rule).data[0]
-            mask = zinc_grammar.masks[next_nonterminal]
-            # Gumbel-max trick: 
-            masked_probability = np.log(np.exp(unmasked_probability) * mask + eps)
-            rule = np.argmax(masked_probability + np.random.gumbel(size=len(zinc_grammar.GCFG.productions())))
-            sampled_rules.append(rule)
-            rhs = filter(lambda a: (type(a) == nltk.grammar.Nonterminal) and (str(a) != 'None'),
-                          zinc_grammar.GCFG.productions()[rule].rhs())
-            S.extend(list(map(str, rhs))[::-1])
-            rule = np.array([rule]).astype(np.int32)
-        self.moves = self.moves + sampled_rules
 
+        self.smiles_rollout = []
+        self.moves_rollout = []
+        for candidate in candidates:
+            self.moves_rollout.append(candidate[2])
+            self.smiles_rollout.append(cfg_util.decode(candidate[2]))
         
     def GetMoves(self):
         # Get all possible moves from this state.
@@ -128,12 +144,19 @@ class State:
     
     def GetResult(self):
         # Get the result
-        smiles = cfg_util.decode(self.moves)
-        try:
-            score = max(1.0, smiles_util.calc_score(smiles))
-        except:
-            score = 0.0
-        return (score, smiles)
+        scores = []
+        for smiles in self.smiles_rollout:
+            try:
+                score = max(0.0, smiles_util.calc_score(smiles))+1.0
+            except:
+                score = 0.0
+            scores.append(score)
+        if scores != []:
+            idx = np.argmax(scores)
+            return (scores[idx], self.smiles_rollout[idx])
+        else:
+            return (0.0, '')
+
 
     def __repr__(self):
         return "moves: {}, stack: {}".format(self.moves, self.stack)
@@ -259,6 +282,12 @@ def main():
     optimizer.setup(rnn)
 
     for _ in range(100):
+        serializers.save_npz("model.npz", rnn)
+        print("model saved.")
+        print("finish pre-training")
+        rootstate = State(rnn=rnn)
+        smiles = MCTS(rootstate, 10000)
+
         print("start pre-training")
         for epoch in range(10000):
             sequence = np.array([np.random.choice(train_rules)]).astype(np.int32)
@@ -272,11 +301,5 @@ def main():
                          loss.backward()
                          loss.unchain_backward()
                          optimizer.update()
-        serializers.save_npz("model.npz", rnn)
-        print("model saved.")
-        print("finish pre-training")
-        rootstate = State(rnn=rnn)
-        smiles = MCTS(rootstate, 10000)
-
 if __name__ == "__main__":
     main()
