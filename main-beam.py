@@ -91,7 +91,7 @@ class State:
         self.rnn.reset_state()
         for m in self.moves:
             self.rnn.forward(np.array([m]).astype(np.int32))
-        beam_width = 8 # must be bigger than 3!
+        beam_width = 16 # must be bigger than 3!
         eps = 1e-100
         lhs_list = zinc_grammar.lhs_list
         lhs_map = zinc_grammar.lhs_map
@@ -281,25 +281,28 @@ def main():
     optimizer = optimizers.Adam()
     optimizer.setup(rnn)
 
-    for _ in range(100):
-        serializers.save_npz("model.npz", rnn)
-        print("model saved.")
-        print("finish pre-training")
-        rootstate = State(rnn=rnn)
-        smiles = MCTS(rootstate, 10000)
+    rootstate = State(rnn=rnn)
+    smiles = MCTS(rootstate, 1000000)
 
-        print("start pre-training")
-        for epoch in range(10000):
-            sequence = np.array([np.random.choice(train_rules)]).astype(np.int32)
-            loss = 0
-            rnn.reset_state()
-            for t in range(len(sequence[0])-1):
-                with chainer.using_config('train', True):
-                     loss += rnn(sequence[:, t], sequence[:, t+1])
-                     if t % 32 == 0 or t==len(sequence[0])-2:
-                         rnn.cleargrads()
-                         loss.backward()
-                         loss.unchain_backward()
-                         optimizer.update()
+    #for _ in range(100):
+    #    serializers.save_npz("model.npz", rnn)
+    #    print("model saved.")
+    #    print("finish pre-training")
+    #    rootstate = State(rnn=rnn)
+    #    smiles = MCTS(rootstate, 10000)
+
+    #    print("start pre-training")
+    #    for epoch in range(10000):
+    #        sequence = np.array([np.random.choice(train_rules)]).astype(np.int32)
+    #        loss = 0
+    #        rnn.reset_state()
+    #        for t in range(len(sequence[0])-1):
+    #            with chainer.using_config('train', True):
+    #                 loss += rnn(sequence[:, t], sequence[:, t+1])
+    #                 if t % 32 == 0 or t==len(sequence[0])-2:
+    #                     rnn.cleargrads()
+    #                     loss.backward()
+    #                     loss.unchain_backward()
+    #                     optimizer.update()
 if __name__ == "__main__":
     main()
