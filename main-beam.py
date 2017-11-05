@@ -26,6 +26,8 @@ import copy
 import zinc_grammar
 import cfg_util
 import smiles_util
+import rdock_util
+import multiprocessing
 
 from math import *
 import numpy as np
@@ -128,11 +130,18 @@ class State:
             if all([len(candidate[1]) == 0 for candidate in candidates]):
                 break
 
-        self.smiles_rollout = []
+        smiles = []
         self.moves_rollout = []
         for candidate in candidates:
             self.moves_rollout.append(candidate[2])
-            self.smiles_rollout.append(cfg_util.decode(candidate[2]))
+            smiles.append(cfg_util.decode(candidate[2]))
+        pool = multiprocessing.Pool(multiprocessing.cpu_count())
+        scores = pool.map(rdock_util.score, smiles)
+        pool.close()
+        pool.terminate()
+        self.rollout_scores = scores
+        self.rollout_smiles = smiles
+        return [(score, smiles) for score, smiles in zip(scores, smiles)]
         
     def GetMoves(self):
         # Get all possible moves from this state.
@@ -144,19 +153,10 @@ class State:
     
     def GetResult(self):
         # Get the result
-        scores = []
-        for smiles in self.smiles_rollout:
-            try:
-                score = max(0.0, smiles_util.calc_score(smiles))+1.0
-            except:
-                score = 0.0
-            scores.append(score)
-        if scores != []:
-            idx = np.argmax(scores)
-            return (scores[idx], self.smiles_rollout[idx])
-        else:
-            return (0.0, '')
-
+        best = np.argmin(self.rollout_scores)
+        s = self.rollout_scores[best]
+        score = -s/(10+abs(s))
+        return (score, self.rollout_smiles[best])
 
     def __repr__(self):
         return "moves: {}, stack: {}".format(self.moves, self.stack)
@@ -222,6 +222,7 @@ class Node:
 
 def MCTS(rootstate, itermax=100, verbose=False):
     rootnode = Node(state = rootstate)
+    results = []
 
     for i in range(itermax):
         node = rootnode
@@ -246,7 +247,11 @@ def MCTS(rootstate, itermax=100, verbose=False):
 
         # Rollout
         if verbose: print("start rollout")
-        state.Rollout()
+        result = state.Rollout()
+        for score, smiles in result:
+            if score < 100:
+                print(score, smiles)
+        results.extend(result)
         if verbose: print("finish rollout")
 
         # Backpropagate
@@ -256,9 +261,6 @@ def MCTS(rootstate, itermax=100, verbose=False):
             node.Update(result)
             node = node.parentNode
         if verbose: print("finish backpropagate")
-
-        if result[0] > 0:
-            print("{},{}".format(smiles_util.calc_score(result[1]), result[1]))
     return rootnode.generatedSmiles
 
 def main():
@@ -269,7 +271,7 @@ def main():
         for line in f:
             smiles = line.rstrip()
             train_smiles.append(smiles)
-            if len(train_smiles) > 1000:
+            if len(train_smiles) > 10:
                 break
     print("converting data")
     train_rules = cfg_util.encode(train_smiles)
@@ -282,7 +284,7 @@ def main():
     optimizer.setup(rnn)
 
     rootstate = State(rnn=rnn)
-    smiles = MCTS(rootstate, 1000000)
+    smiles = MCTS(rootstate, 10000)
 
     #for _ in range(100):
     #    serializers.save_npz("model.npz", rnn)
